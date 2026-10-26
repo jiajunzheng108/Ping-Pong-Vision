@@ -1,0 +1,22 @@
+# Ping-Pong-Vision dependencies
+# Python 3.8+ recommended
+# Install: pip install -r requirements.txt
+
+# Core numeric / image processing
+numpy
+opencv-python
+
+# Deep learning (inference & training)
+torch
+torchvision
+ultralytics
+
+# Segment Anything (table mask auto-annotation)
+git+https://github.com/facebookresearch/segment-anything.git
+
+# Dataset preparation
+wget
+tqdm
+
+# Training configuration (ball_detection/train_yolov8.py)
+PyYAML

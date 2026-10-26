@@ -10,3 +10,19 @@ SAM/dataset
 SAM/output
 /dataset
 /models
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Editors / local config
+.idea/
+.vscode/
+.env
+
+# Test outputs
+Data/yolo_test.mp4

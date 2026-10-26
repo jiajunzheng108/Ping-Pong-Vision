@@ -1,7 +1,9 @@
+import argparse
 import os
 from glob import glob
+
 import cv2
-from tqdm import tqdm  # Add this import
+from tqdm import tqdm
 
 
 def make_folder(folder_path):
@@ -9,47 +11,86 @@ def make_folder(folder_path):
         os.makedirs(folder_path)
 
 
-def extract_images_from_videos(video_path, out_images_dir):
+def extract_images_from_videos(video_path, out_images_dir, frame_step=1,
+                               max_frames=0, overwrite=False):
     video_fn = os.path.basename(video_path)[:-4]
     sub_images_dir = os.path.join(out_images_dir, video_fn)
-
     make_folder(sub_images_dir)
 
     video_cap = cv2.VideoCapture(video_path)
-    n_frames = video_cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    n_frames = int(video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
     f_width = video_cap.get(cv2.CAP_PROP_FRAME_WIDTH)
     f_height = video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    print('video_fn: {}.mp4, number of frames: {}, f_width: {}, f_height: {}'.format(video_fn, n_frames, f_width,
-                                                                                     f_height))
+    print('video_fn: {}.mp4, number of frames: {}, f_width: {}, f_height: {}'.format(
+        video_fn, n_frames, f_width, f_height))
+
+    expected = n_frames // frame_step if max_frames <= 0 else max_frames
+    pbar = tqdm(total=max(expected, 1))
 
     frame_cnt = -1
-    pbar = tqdm(total=int(n_frames))  # Add progress bar
+    processed = 0
+    saved = 0
+
     while True:
         ret, img = video_cap.read()
-        if ret:
-            frame_cnt += 1
-            image_path = os.path.join(sub_images_dir, 'img_{:06d}.jpg'.format(frame_cnt))
-            if os.path.isfile(image_path):
-                print('video {} had been already extracted'.format(video_path))
-                break
+        if not ret:
+            break
+
+        frame_cnt += 1
+        if frame_cnt % frame_step != 0:
+            continue
+
+        processed += 1
+        pbar.update(1)
+
+        image_path = os.path.join(sub_images_dir, 'img_{:06d}.jpg'.format(frame_cnt))
+        if overwrite or not os.path.isfile(image_path):
             cv2.imwrite(image_path, img)
-            pbar.update(1)  # Update progress bar
-        else:
+            saved += 1
+
+        if max_frames > 0 and processed >= max_frames:
             break
-        if cv2.waitKey(10) & 0xFF == ord('q'):
-            break
+
     video_cap.release()
-    pbar.close()  # Close progress bar
-    print('done extraction: {}'.format(video_path))
+    pbar.close()
+    print('done extraction: {} (processed {}, saved {})'.format(video_path, processed, saved))
 
 
-if __name__ == '__main__':
+def main():
+    parser = argparse.ArgumentParser(description='Extract frames from OpenTTGames videos')
+    parser.add_argument('--split', choices=['training', 'test', 'both'], default='both')
+    parser.add_argument('--games', default='', help='comma separated video ids, empty = all')
+    parser.add_argument('--frame-step', type=int, default=1, help='save every Nth frame')
+    parser.add_argument('--max-frames', type=int, default=0, help='max frames per video, 0 = all')
+    parser.add_argument('--overwrite', action='store_true', help='overwrite existing images')
+    args = parser.parse_args()
+
+    splits = ['training', 'test'] if args.split == 'both' else [args.split]
+    wanted = {int(x) for x in args.games.split(',') if x.strip()} if args.games else None
+
     dataset_dir = '../dataset'
-    for dataset_type in ['training', 'test']:
+    for dataset_type in splits:
         video_dir = os.path.join(dataset_dir, dataset_type, 'videos')
         out_images_dir = os.path.join(dataset_dir, dataset_type, 'images')
 
-        video_paths = glob(os.path.join(video_dir, '*.mp4'))
+        video_paths = sorted(glob(os.path.join(video_dir, '*.mp4')))
+        for video_path in video_paths:
+            stem = os.path.splitext(os.path.basename(video_path))[0]
+            try:
+                video_id = int(stem.split('_')[-1])
+            except ValueError:
+                video_id = None
+            if wanted is not None and video_id not in wanted:
+                continue
 
-        for video_idx, video_path in enumerate(video_paths):
-            extract_images_from_videos(video_path, out_images_dir)
+            extract_images_from_videos(
+                video_path,
+                out_images_dir,
+                frame_step=args.frame_step,
+                max_frames=args.max_frames,
+                overwrite=args.overwrite,
+            )
+
+
+if __name__ == '__main__':
+    main()
