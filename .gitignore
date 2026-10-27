@@ -1,5 +1,5 @@
-*.pth
-*.pt
+# *.pth
+# *.pt
 ball_detection/ball_detection
 ball_detection/logs
 ball_detection/runs
@@ -8,6 +8,7 @@ table_key_points/annotations
 table_key_points/saved_models
 SAM/dataset
 SAM/output
+/dataset
 /dataset
 /models
 
@@ -24,5 +25,9 @@ __pycache__/
 .vscode/
 .env
 
-# Test outputs
-Data/yolo_test.mp4
+# Data
+Data/
+
+# runs
+runs/**/*.jpg
+runs/**/*.png

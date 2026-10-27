@@ -183,8 +183,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 
 ## 📞 Contact
-- LinkedIn: https://www.linkedin.com/in/narasimha-karthik/
-- Email: narasimhakarthik2@gmail.com
 
 ## 📚 Citation
 If you use this project in your research or work, please cite:
