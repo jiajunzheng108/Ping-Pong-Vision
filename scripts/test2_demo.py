@@ -2,216 +2,33 @@ import argparse
 import json
 import sys
 import time
-import zipfile
 from collections import deque
 from pathlib import Path
 
 import cv2
-import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / 'prepare_dataset'))
 
 from prepare_dataset.read_zip import load_ball_markup, load_events  # noqa: E402
-
-MAP_W = 540
-MAP_H = 360
-TABLE_LEFT = 30
-TABLE_TOP = 70
-TABLE_RIGHT = 510
-TABLE_BOTTOM = 337
-MAX_TRAIL_GAP = 12
-
-
-def order_corners(points):
-    """Order 4 points as TL, TR, BL, BR for a roughly horizontal table."""
-    points = sorted(points.tolist(), key=lambda p: p[1])
-    top = sorted(points[:2], key=lambda p: p[0])
-    bottom = sorted(points[2:], key=lambda p: p[0])
-    return np.array([top[0], top[1], bottom[0], bottom[1]], dtype=np.float32)
-
-
-def extract_table_corners(zip_path, video_width, video_height):
-    """Derive the 4 table corners from the red table mask in the zip."""
-    with zipfile.ZipFile(zip_path) as zf:
-        mask_names = sorted(n for n in zf.namelist() if n.endswith('.png'))
-        for name in mask_names:
-            mask = cv2.imdecode(
-                np.frombuffer(zf.read(name), np.uint8), cv2.IMREAD_UNCHANGED)
-            if mask is None or mask.ndim != 3:
-                continue
-
-            red = ((mask[:, :, 2] > 200) &
-                   (mask[:, :, 1] < 50) &
-                   (mask[:, :, 0] < 50)).astype(np.uint8) * 255
-            if red.sum() < 100:
-                continue
-
-            contours, _ = cv2.findContours(
-                red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                continue
-
-            contour = max(contours, key=cv2.contourArea)
-            hull = cv2.convexHull(contour)
-            perimeter = cv2.arcLength(hull, True)
-
-            approx = None
-            for epsilon in (0.01, 0.02, 0.03, 0.05, 0.08, 0.12, 0.2):
-                candidate = cv2.approxPolyDP(hull, epsilon * perimeter, True)
-                if len(candidate) == 4:
-                    approx = candidate
-                    break
-            if approx is None:
-                rect = cv2.minAreaRect(hull)
-                approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
-
-            points = approx.reshape(-1, 2).astype(np.float32)
-            if len(points) < 4:
-                continue
-            if len(points) > 4:
-                points = points[:4]
-
-            points[:, 0] *= video_width / mask.shape[1]
-            points[:, 1] *= video_height / mask.shape[0]
-            return order_corners(points)
-
-    raise RuntimeError('could not extract table corners from segmentation masks')
-
-
-def build_homography(corners):
-    dst = np.float32([
-        [TABLE_LEFT, TABLE_TOP],
-        [TABLE_RIGHT, TABLE_TOP],
-        [TABLE_LEFT, TABLE_BOTTOM],
-        [TABLE_RIGHT, TABLE_BOTTOM],
-    ])
-    return cv2.getPerspectiveTransform(corners, dst)
-
-
-def to_topdown(matrix, point):
-    if point is None:
-        return None
-    src = np.array([[point]], dtype=np.float32)
-    dst = cv2.perspectiveTransform(src, matrix)[0][0]
-    x = int(min(max(dst[0], 0), MAP_W - 1))
-    y = int(min(max(dst[1], 0), MAP_H - 1))
-    return (x, y)
-
-
-def create_base_map():
-    canvas = np.zeros((MAP_H, MAP_W, 3), dtype=np.uint8)
-    canvas[:] = (40, 40, 40)
-
-    left, top = TABLE_LEFT, TABLE_TOP
-    right, bottom = TABLE_RIGHT, TABLE_BOTTOM
-    cv2.rectangle(canvas, (left, top), (right, bottom), (0, 168, 255), -1)
-    cv2.rectangle(canvas, (left, top), (right, bottom), (255, 255, 255), 2)
-
-    center_y = (top + bottom) // 2
-    center_x = (left + right) // 2
-    cv2.line(canvas, (left, center_y), (right, center_y), (255, 255, 255), 1)
-    cv2.line(canvas, (center_x, top), (center_x, bottom), (255, 255, 255), 4)
-
-    cv2.putText(canvas, 'Top-down (z=0 approx)', (12, MAP_H - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
-    return canvas
-
-
-def draw_trail(canvas, trail, color):
-    points = list(trail)
-    for i in range(1, len(points)):
-        frame0, p0 = points[i - 1]
-        frame1, p1 = points[i]
-        if frame1 - frame0 > MAX_TRAIL_GAP:
-            continue
-        alpha = 0.25 + 0.75 * (i / len(points))
-        c = tuple(int(ch * alpha) for ch in color)
-        cv2.line(canvas, p0, p1, c, 2, cv2.LINE_AA)
-
-
-def draw_minimap(frame, base_map, pred_trail, gt_trail, last_pred,
-                 last_gt, bounce_marks, frame_idx, fps):
-    canvas = base_map.copy()
-
-    draw_trail(canvas, gt_trail, (0, 255, 0))
-    draw_trail(canvas, pred_trail, (0, 200, 255))
-
-    max_age = max(int(fps * 2), 1)
-    for mark in bounce_marks:
-        age = frame_idx - mark['frame']
-        if age < 0 or age > max_age:
-            continue
-        alpha = 1.0 - age / max_age
-        color = (0, 255, 255) if mark['kind'] == 'bounce' else (255, 0, 255)
-        color = tuple(int(ch * alpha) for ch in color)
-        cv2.circle(canvas, mark['pos'], 6, color, -1, cv2.LINE_AA)
-        cv2.putText(canvas, mark['kind'][:1].upper(),
-                    (mark['pos'][0] + 8, mark['pos'][1] - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
-
-    if last_gt is not None:
-        cv2.circle(canvas, last_gt, 5, (0, 255, 0), -1, cv2.LINE_AA)
-    if last_pred is not None:
-        cv2.circle(canvas, last_pred, 5, (0, 0, 255), -1, cv2.LINE_AA)
-
-    cv2.rectangle(canvas, (0, 0), (MAP_W - 1, MAP_H - 1), (200, 200, 200), 1)
-
-    frame_h, frame_w = frame.shape[:2]
-    x0 = max(frame_w - MAP_W - 20, 0)
-    y0 = 20
-    if x0 + MAP_W <= frame_w and y0 + MAP_H <= frame_h:
-        frame[y0:y0 + MAP_H, x0:x0 + MAP_W] = canvas
-    return frame
-
-
-def draw_overlay(frame, frame_idx, total_frames, gt, pred, distance, event,
-                 recall, matched, gt_frames, fps):
-    panel = frame.copy()
-    cv2.rectangle(panel, (10, 10), (470, 150), (0, 0, 0), -1)
-    frame = cv2.addWeighted(panel, 0.45, frame, 0.55, 0)
-
-    lines = [
-        'frame {}/{}  t={:.2f}s'.format(
-            frame_idx, total_frames, frame_idx / max(fps, 1)),
-        'pred conf: {}'.format('--' if pred is None else '{:.2f}'.format(pred[4])),
-        'gt-pred: {}'.format('--' if distance is None else '{:.1f} px'.format(distance)),
-        'recall: {}/{} ({:.1f}%)'.format(
-            matched, gt_frames, 100.0 * recall if gt_frames else 0.0),
-    ]
-    y = 36
-    for line in lines:
-        cv2.putText(frame, line, (22, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65, (255, 255, 255), 2)
-        y += 28
-
-    if gt is not None:
-        cv2.circle(frame, (int(gt[0]), int(gt[1])), 7, (0, 255, 0), 2, cv2.LINE_AA)
-        cv2.putText(frame, 'GT', (int(gt[0]) + 10, int(gt[1]) - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-    if pred is not None:
-        x1, y1, x2, y2, conf = pred
-        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)),
-                      (0, 0, 255), 2)
-        cv2.circle(frame, (int((x1 + x2) / 2), int((y1 + y2) / 2)),
-                   4, (0, 0, 255), -1, cv2.LINE_AA)
-        cv2.putText(frame, 'ball {:.2f}'.format(conf),
-                    (int(x1), max(int(y1) - 8, 14)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-    if gt is not None and pred is not None:
-        pred_center = (int((pred[0] + pred[2]) / 2), int((pred[1] + pred[3]) / 2))
-        cv2.line(frame, (int(gt[0]), int(gt[1])), pred_center,
-                 (0, 255, 255), 2, cv2.LINE_AA)
-
-    if event:
-        text = event.upper()
-        (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
-        x = (frame.shape[1] - tw) // 2
-        cv2.putText(frame, text, (x, 55), cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0, (0, 255, 255), 3)
-    return frame
+from test2_demo_lib.config import BOUNCE_MARK_LENGTH, TRAIL_LENGTH  # noqa: E402
+from test2_demo_lib.detector import detect_ball, load_model, parse_classes  # noqa: E402
+from test2_demo_lib.metrics import DemoMetrics  # noqa: E402
+from test2_demo_lib.table import (  # noqa: E402
+    build_homography,
+    extract_table_corners,
+    to_topdown,
+)
+from test2_demo_lib.visualize import (  # noqa: E402
+    add_bounce_mark,
+    build_event_display,
+    create_base_map,
+    draw_minimap,
+    draw_overlay,
+)
 
 
 def main():
@@ -232,13 +49,9 @@ def main():
     parser.add_argument('--display', action='store_true')
     args = parser.parse_args()
 
-    from ultralytics import YOLO
-
     model_path = Path(args.model)
-    if not model_path.exists():
-        raise FileNotFoundError('model not found: {}'.format(model_path))
-
-    classes = [int(x) for x in args.classes.split(',') if x.strip()] or None
+    model = load_model(args.model)
+    classes = parse_classes(args.classes)
 
     cap = cv2.VideoCapture(str(args.video))
     if not cap.isOpened():
@@ -257,17 +70,11 @@ def main():
     print('table corners (TL, TR, BL, BR):')
     print(corners)
 
-    event_display = {}
-    for frame, kind in events.items():
-        if kind not in ('bounce', 'net'):
-            continue
-        for delta in range(-8, 17):
-            event_display.setdefault(frame + delta, []).append(kind)
-
+    event_display = build_event_display(events)
     base_map = create_base_map()
-    pred_trail = deque(maxlen=120)
-    gt_trail = deque(maxlen=120)
-    bounce_marks = deque(maxlen=200)
+    pred_trail = deque(maxlen=TRAIL_LENGTH)
+    gt_trail = deque(maxlen=TRAIL_LENGTH)
+    bounce_marks = deque(maxlen=BOUNCE_MARK_LENGTH)
 
     output_fps = args.output_fps if args.output_fps > 0 else fps
     write_step = max(int(round(fps / output_fps)), 1)
@@ -278,16 +85,7 @@ def main():
         str(output_path), cv2.VideoWriter_fourcc(*'mp4v'),
         output_fps, (width, height))
 
-    model = YOLO(str(model_path))
-
-    gt_frames = 0
-    pred_frames = 0
-    matched = 0
-    fp_negative = 0
-    errors = []
-    matched_errors = []
-    last_pred = None
-    last_gt = None
+    metrics = DemoMetrics(args.match_threshold)
     last_table_pred = None
     last_table_gt = None
 
@@ -311,67 +109,37 @@ def main():
             else:
                 is_negative = True
 
-        results = model(frame, conf=args.conf, classes=classes,
-                        imgsz=args.imgsz, verbose=False)[0]
-        pred = None
-        if len(results.boxes) > 0:
-            boxes = results.boxes
-            best = int(boxes.conf.argmax())
-            x1, y1, x2, y2 = boxes.xyxy[best].cpu().numpy().tolist()
-            conf = float(boxes.conf[best].cpu().item())
-            pred = (x1, y1, x2, y2, conf)
-
-        distance = None
-        if gt is not None:
-            gt_frames += 1
-            if pred is not None:
-                center = ((pred[0] + pred[2]) / 2.0, (pred[1] + pred[3]) / 2.0)
-                distance = float(np.hypot(center[0] - gt[0], center[1] - gt[1]))
-                if distance <= args.match_threshold:
-                    matched += 1
-                    matched_errors.append(distance)
-                errors.append(distance)
-        elif is_negative and pred is not None:
-            fp_negative += 1
+        pred = detect_ball(model, frame, conf=args.conf,
+                           classes=classes, imgsz=args.imgsz)
+        distance = metrics.update(gt, pred, is_negative)
 
         if pred is not None:
-            pred_frames += 1
-            last_pred = ((pred[0] + pred[2]) / 2.0, (pred[1] + pred[3]) / 2.0)
-            last_table_pred = to_topdown(homography, last_pred)
+            center = ((pred[0] + pred[2]) / 2.0, (pred[1] + pred[3]) / 2.0)
+            last_table_pred = to_topdown(homography, center)
             pred_trail.append((frame_idx, last_table_pred))
 
         if gt is not None:
-            last_gt = gt
             last_table_gt = to_topdown(homography, gt)
             gt_trail.append((frame_idx, last_table_gt))
 
         if frame_idx in events and events[frame_idx] in ('bounce', 'net'):
-            pos = None
-            if last_table_pred is not None:
-                pos = last_table_pred
-            elif last_table_gt is not None:
-                pos = last_table_gt
+            pos = last_table_pred if last_table_pred is not None else last_table_gt
             if pos is not None:
-                bounce_marks.append({
-                    'frame': frame_idx,
-                    'pos': pos,
-                    'kind': events[frame_idx],
-                })
+                add_bounce_mark(bounce_marks, frame_idx, pos, events[frame_idx])
 
         active_event = None
         if frame_idx in event_display:
             active_event = event_display[frame_idx][-1]
 
-        recall = matched / gt_frames if gt_frames else 0.0
         frame = draw_overlay(frame, frame_idx, total_frames, gt, pred,
-                             distance, active_event, recall, matched,
-                             gt_frames, fps)
+                             distance, active_event, metrics.recall,
+                             metrics.matched, metrics.gt_frames, fps)
         frame = draw_minimap(frame, base_map, pred_trail, gt_trail,
                              last_table_pred, last_table_gt, bounce_marks,
                              frame_idx, fps)
 
         if args.show_corners:
-            cv2.polylines(frame, [corners.astype(np.int32)], True,
+            cv2.polylines(frame, [corners.astype('int32')], True,
                           (0, 255, 0), 2)
 
         if frame_idx % write_step == 0:
@@ -394,20 +162,7 @@ def main():
     cv2.destroyAllWindows()
 
     elapsed = max(time.time() - start, 1e-6)
-    if errors:
-        errors_arr = np.array(errors)
-        mean_error = float(errors_arr.mean())
-        median_error = float(np.median(errors_arr))
-        p90_error = float(np.percentile(errors_arr, 90))
-    else:
-        mean_error = median_error = p90_error = 0.0
-
-    if matched_errors:
-        matched_arr = np.array(matched_errors)
-        mean_matched_error = float(matched_arr.mean())
-        median_matched_error = float(np.median(matched_arr))
-    else:
-        mean_matched_error = median_matched_error = 0.0
+    summary = metrics.summary()
 
     stats = {
         'video': str(Path(args.video).resolve()),
@@ -419,17 +174,7 @@ def main():
         'imgsz': args.imgsz,
         'match_threshold_px': args.match_threshold,
         'processed_frames': processed,
-        'gt_frames': gt_frames,
-        'pred_frames': pred_frames,
-        'matched': matched,
-        'missed': gt_frames - matched,
-        'recall': recall,
-        'fp_on_negative_frames': fp_negative,
-        'mean_center_error_px': mean_error,
-        'median_center_error_px': median_error,
-        'p90_center_error_px': p90_error,
-        'mean_matched_error_px': mean_matched_error,
-        'median_matched_error_px': median_matched_error,
+        **summary,
         'elapsed_sec': elapsed,
         'processed_fps': processed / elapsed,
     }
@@ -441,14 +186,19 @@ def main():
 
     print('\nprocessed {} frames in {:.1f}s ({:.1f} FPS)'.format(
         processed, elapsed, processed / elapsed))
-    print('gt frames: {}, pred frames: {}'.format(gt_frames, pred_frames))
+    print('gt frames: {}, pred frames: {}'.format(
+        summary['gt_frames'], summary['pred_frames']))
     print('matched: {}, missed: {}, recall: {:.4f}'.format(
-        matched, gt_frames - matched, recall))
+        summary['matched'], summary['missed'], summary['recall']))
     print('center error px: mean={:.2f}, median={:.2f}, p90={:.2f}'.format(
-        mean_error, median_error, p90_error))
+        summary['mean_center_error_px'],
+        summary['median_center_error_px'],
+        summary['p90_center_error_px']))
     print('matched center error px: mean={:.2f}, median={:.2f}'.format(
-        mean_matched_error, median_matched_error))
-    print('false positives on explicit negative frames: {}'.format(fp_negative))
+        summary['mean_matched_error_px'],
+        summary['median_matched_error_px']))
+    print('false positives on explicit negative frames: {}'.format(
+        summary['fp_on_negative_frames']))
     print('output: {}'.format(output_path.resolve()))
     print('stats: {}'.format(stats_path.resolve()))
 
