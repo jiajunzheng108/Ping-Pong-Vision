@@ -8,7 +8,7 @@ from ultralytics import YOLO
 
 def parse_args():
     parser = argparse.ArgumentParser(description="YOLO-only ping pong ball test")
-    parser.add_argument("--source", default="Data/quad.mp4", help="input video")
+    parser.add_argument("--source", default="Data/test2.mp4", help="input video")
     parser.add_argument("--model", default="yolov8n.pt", help="YOLO weights")
     parser.add_argument("--output", default="Data/yolo_test.mp4", help="output video")
     parser.add_argument("--conf", type=float, default=0.25, help="confidence threshold")
